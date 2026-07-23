@@ -251,7 +251,8 @@ public abstract class DataPack {
     }
 
     public final boolean isUpToDate(Context context) {
-        return getInstallationDir(context, getVersionCode()).exists();
+        return EmbeddedData.getPath(context, getType(), getName()) != null
+                || getInstallationDir(context, getVersionCode()).exists();
     }
 
     protected static final void copyBytes(InputStream in, OutputStream out, IDataSyncCallback callback) throws IOException {
@@ -580,6 +581,9 @@ public abstract class DataPack {
     }
 
     public final String getPath(Context context) {
+        String embeddedPath = EmbeddedData.getPath(context, getType(), getName());
+        if (embeddedPath != null)
+            return embeddedPath;
         File dir = getInstallationDir(context, getVersionCode());
         if (dir.exists())
             return dir.getPath();
@@ -621,6 +625,8 @@ public abstract class DataPack {
     public abstract boolean getEnabled(Context context);
 
     public boolean sync(Context context, IDataSyncCallback callback) {
+        if (EmbeddedData.getPath(context, getType(), getName()) != null)
+            return true;
         if (getEnabled(context)) {
             if (!isUpToDate(context)) {
                 boolean installed = install(context, callback);
@@ -649,6 +655,8 @@ public abstract class DataPack {
     }
 
     public long getSyncFlag(Context context, boolean checkPkg) {
+        if (EmbeddedData.getPath(context, getType(), getName()) != null)
+            return 0;
         if (!getEnabled(context)) {
             if (isInstalled(context))
                 return SyncFlags.LOCAL;

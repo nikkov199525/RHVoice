@@ -502,15 +502,10 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
     protected String[] onGetLanguage() {
         if (BuildConfig.DEBUG)
             Log.v(TAG, "onGetLanguage called");
-        String[] result = {"eng", "", ""};
+        String[] result = {"rus", "RUS", ""};
         final AndroidVoiceInfo voice = currentVoice;
-        if (voice == null) {
-            final Locale loc = Locale.getDefault();
-            final LanguagePack lp = Repository.get().createDataManager().getLanguageByCode(loc.getISO3Language());
-            if (lp != null && lp.isInstalled(this))
-                result[0] = lp.getCode();
+        if (voice == null)
             return result;
-        }
         result[0] = voice.getLanguage();
         result[1] = voice.getCountry();
         result[2] = voice.getVariant();
@@ -545,7 +540,12 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
         }
         if (BuildConfig.DEBUG)
             Log.v(TAG, "Result: " + result);
-        return result;
+        // Screen readers may probe their interface locale before selecting a
+        // Russian engine. Keep the engine available and synthesize such text
+        // through RHVoice's pseudo-English support.
+        return result == TextToSpeech.LANG_NOT_SUPPORTED
+                ? TextToSpeech.LANG_AVAILABLE
+                : result;
     }
 
     @Override
@@ -680,10 +680,13 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
         }
         final DataManager dm = Repository.get().createDataManager();
         final LanguagePack lp = dm.getLanguageByCode(language);
-        if (lp == null || !lp.hasVoices())
-            return null;
-        if (lp.iterVoices().filter(v -> v.getEnabled(this) && v.isInstalled(this)).isEmpty())
-            return null;
+        if (lp == null || !lp.hasVoices()
+                || lp.iterVoices().filter(v -> v.getEnabled(this) && v.isInstalled(this)).isEmpty()) {
+            final LanguagePack fallback = dm.getLanguageByCode("rus");
+            if (fallback == null || !fallback.hasVoices())
+                return null;
+            return (new Locale(fallback.getOldCode())).getDisplayLanguage(Locale.ENGLISH);
+        }
         return (new Locale(lp.getOldCode())).getDisplayLanguage(Locale.ENGLISH);
     }
 

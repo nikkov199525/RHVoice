@@ -1,15 +1,182 @@
 apply plugin: 'com.android.application'
 
+import groovy.json.JsonOutput
+import java.security.MessageDigest
+
 ext.major_version = 1
 ext.minor_version = 18
 ext.revision_number = 4
 ext.baseVersionCode = 100000 * major_version + 1000 * minor_version + 10 * revision_number
 
-ext.base_pkg_dir_url = 'https://rhvoice.org/download/packages-%s.json'
+task BoostIncludes(type: Sync) {
+    into rootProject.file("../../external/libs/boost/include/boost")
+    rootProject.file("../../external/libs/boost/libs").eachDir { libraryDir ->
+        File includeDir = new File(libraryDir, "include/boost")
+        if (includeDir.isDirectory()) {
+            from includeDir
+        }
+    }
+    includeEmptyDirs = false
+}
 
-task BoostIncludes(type: Exec) {
-    workingDir '../../..'
-    commandLine 'scons', 'external/libs/boost/include/boost'
+def embeddedAssetsDir = layout.buildDirectory.dir("generated/embeddedAssets")
+def embeddedDataDir = layout.buildDirectory.dir("generated/embeddedData")
+def customVoicesDir = providers.gradleProperty("RHVoice.customVoicesDir")
+        .map { rootProject.file(it) }
+        .getOrElse(rootProject.file("../../../customvoices/data/voices"))
+
+def readInfo = { File infoFile ->
+    Properties properties = new Properties()
+    infoFile.withReader("UTF-8") { properties.load(it) }
+    properties
+}
+
+def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
+    def languageSources = [
+            rootProject.file("../../data/languages/Russian"),
+            rootProject.file("../../data/languages/English")
+    ]
+    def officialVoiceSources = [
+            rootProject.file("../../data/voices/yuriy"),
+            rootProject.file("../../data/voices/aleksandr-hq")
+    ]
+
+    inputs.files(languageSources)
+    inputs.files(officialVoiceSources)
+    inputs.dir(customVoicesDir).optional()
+    outputs.dir(embeddedAssetsDir)
+
+    doLast {
+        if (!customVoicesDir.isDirectory()) {
+            throw new GradleException(
+                    "Custom voices were not found at ${customVoicesDir}. " +
+                            "Set RHVoice.customVoicesDir to the directory containing voice folders."
+            )
+        }
+
+        File stagingDir = embeddedDataDir.get().asFile
+        File assetsDir = embeddedAssetsDir.get().asFile
+        delete(stagingDir, assetsDir)
+        stagingDir.mkdirs()
+        assetsDir.mkdirs()
+
+        languageSources.each { File sourceDir ->
+            if (!new File(sourceDir, "language.info").isFile()) {
+                throw new GradleException("Invalid embedded language directory: ${sourceDir}")
+            }
+            copy {
+                from sourceDir
+                into new File(stagingDir, "languages/${sourceDir.name}")
+                exclude ".git"
+            }
+        }
+
+        List<File> voiceSources = new ArrayList<>(officialVoiceSources)
+        customVoicesDir.listFiles()
+                ?.findAll { it.isDirectory() && new File(it, "voice.info").isFile() }
+                ?.sort { it.name.toLowerCase(Locale.ROOT) }
+                ?.each { voiceSources.add(it) }
+
+        if (voiceSources.size() == officialVoiceSources.size()) {
+            throw new GradleException("No custom voices were found in ${customVoicesDir}")
+        }
+
+        List<Map<String, Object>> voiceResources = []
+        voiceSources.each { File sourceDir ->
+            File infoFile = new File(sourceDir, "voice.info")
+            if (!infoFile.isFile()) {
+                throw new GradleException("Invalid embedded voice directory: ${sourceDir}")
+            }
+            Properties info = readInfo(infoFile)
+            String voiceName = info.getProperty("name")
+            if (!voiceName) {
+                throw new GradleException("Voice name is missing in ${infoFile}")
+            }
+            copy {
+                from sourceDir
+                into new File(stagingDir, "voices/${voiceName}")
+                exclude ".git"
+            }
+            voiceResources.add([
+                    name     : voiceName,
+                    ctry2code: "RU",
+                    ctry3code: "RUS",
+                    version  : [
+                            major: Integer.parseInt(info.getProperty("format")),
+                            minor: Integer.parseInt(info.getProperty("revision"))
+                    ],
+                    dataUrl  : "",
+                    dataMd5  : "",
+                    id       : voiceName.toLowerCase(Locale.ROOT).replace("-", "_")
+            ])
+        }
+
+        Properties russianInfo = readInfo(new File(languageSources[0], "language.info"))
+        Properties englishInfo = readInfo(new File(languageSources[1], "language.info"))
+        Map<String, Object> packageDirectory = [
+                ttl          : 86400,
+                localTtl     : 0,
+                languages    : [
+                        [
+                                lang2code   : "en",
+                                lang3code   : "eng",
+                                testMessage: "If you can hear this message, the voice is installed and working.",
+                                name        : "English",
+                                version     : [
+                                        major: Integer.parseInt(englishInfo.getProperty("format")),
+                                        minor: Integer.parseInt(englishInfo.getProperty("revision"))
+                                ],
+                                dataUrl     : "",
+                                dataMd5     : "",
+                                id          : "english",
+                                voices      : []
+                        ],
+                        [
+                                lang2code   : "ru",
+                                lang3code   : "rus",
+                                testMessage: "Если вы слышите это сообщение, значит, голос установлен и работает.",
+                                name        : "Russian",
+                                version     : [
+                                        major: Integer.parseInt(russianInfo.getProperty("format")),
+                                        minor: Integer.parseInt(russianInfo.getProperty("revision"))
+                                ],
+                                dataUrl     : "",
+                                dataMd5     : "",
+                                id          : "russian",
+                                pseudoEnglish: true,
+                                voices      : voiceResources
+                        ]
+                ],
+                defaultVoices: [ru: ["*": "yuriy"]]
+        ]
+        new File(stagingDir, "packages.json").setText(
+                JsonOutput.prettyPrint(JsonOutput.toJson(packageDirectory)),
+                "UTF-8"
+        )
+
+        MessageDigest digest = MessageDigest.getInstance("SHA-256")
+        fileTree(stagingDir).files.sort { a, b ->
+            stagingDir.toPath().relativize(a.toPath()).toString() <=>
+                    stagingDir.toPath().relativize(b.toPath()).toString()
+        }.each { File file ->
+            digest.update(stagingDir.toPath().relativize(file.toPath()).toString().getBytes("UTF-8"))
+            file.withInputStream { stream ->
+                byte[] buffer = new byte[8192]
+                int count
+                while ((count = stream.read(buffer)) != -1) {
+                    digest.update(buffer, 0, count)
+                }
+            }
+        }
+        String version = digest.digest().encodeHex().toString()
+        new File(assetsDir, "embedded-data.version").setText(version, "UTF-8")
+
+        ant.zip(
+                destfile: new File(assetsDir, "embedded-data.zip"),
+                basedir: stagingDir,
+                level: 9
+        )
+    }
 }
 
 android {
@@ -27,6 +194,12 @@ android {
     buildFeatures {
         prefab true
         buildConfig true
+    }
+
+    sourceSets {
+        main {
+            assets.srcDir embeddedAssetsDir
+        }
     }
 
     defaultConfig {
@@ -86,14 +259,12 @@ android {
             dimension 'dir'
             versionCode = baseVersionCode + 5
             versionNameSuffix '-alpha'
-            ext.pkgDirUrl = sprintf(base_pkg_dir_url, "latest")
         }
 
         dev {
             dimension 'dir'
             versionCode = baseVersionCode + 9
             versionNameSuffix '-dev'
-            ext.pkgDirUrl = findProperty('RHVoice.devPkgDirUrl') ?: sprintf(base_pkg_dir_url, "dev")
         }
     }
 }
@@ -117,7 +288,6 @@ dependencies {
     implementation 'com.google.guava:guava:31.1-android'
     implementation 'com.squareup.moshi:moshi:1.14.0'
     implementation 'io.github.vvb2060.ndk:curl:8.1.1'
-    implementation 'org.conscrypt:conscrypt-android:2.5.2'
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.3'
 
     implementation 'androidx.multidex:multidex:2.0.1'
@@ -126,20 +296,4 @@ dependencies {
 }
 
 preBuild.dependsOn BoostIncludes
-
-afterEvaluate {
-    def header = file("src/main/jni/generated/pkg_config.h")
-    android.applicationVariants.each { variant ->
-        def flavor = variant.productFlavors[0]
-        if (!flavor.ext.has('pkgDirUrl')) return
-        def url = flavor.ext.pkgDirUrl
-        def genTask = tasks.register("generatePkgConfig${variant.name.capitalize()}") {
-            outputs.file(header)
-            doLast {
-                header.parentFile.mkdirs()
-                header.text = "#pragma once\n#define PKG_DIR_URL \"${url}\"\n"
-            }
-        }
-        tasks.named("pre${variant.name.capitalize()}Build") { dependsOn genTask }
-    }
-}
+preBuild.dependsOn prepareEmbeddedData

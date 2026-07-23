@@ -60,7 +60,11 @@ public final class VoicePack extends DataPack {
 
     @Override
     public final boolean getEnabled(Context context) {
-        return getPrefs(context).getBoolean(getEnabledKey(), getPackageInfo(context) != null);
+        return getPrefs(context).getBoolean(
+                getEnabledKey(),
+                EmbeddedData.getPath(context, getType(), getName()) != null
+                        || getPackageInfo(context) != null
+        );
     }
 
     public final void setEnabled(Context context, boolean value) {

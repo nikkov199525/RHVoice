@@ -21,14 +21,6 @@ import android.util.Log;
 
 import com.google.android.material.color.DynamicColors;
 
-import java.security.Provider;
-import java.security.Security;
-
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-
-import org.conscrypt.Conscrypt;
-
 public final class MyApplication extends MultiDexApplication {
     private static final String TAG = "RHVoice.MyApplication";
 
@@ -37,16 +29,10 @@ public final class MyApplication extends MultiDexApplication {
         super.onCreate();
         DynamicColors.applyToActivitiesIfAvailable(this);
         try {
-            Provider provider = Conscrypt.newProvider();
-            Security.insertProviderAt(provider, 1);
-            SSLContext context = SSLContext.getInstance("TLS", provider);
-            context.init(null, null, null);
-            HttpsURLConnection.setDefaultSSLSocketFactory(context.getSocketFactory());
-            if (BuildConfig.DEBUG)
-                Log.d(TAG, "Replaced default ssl socket factory");
-        } catch (Exception e) {
-            if (BuildConfig.DEBUG)
-                Log.e(TAG, "Error", e);
+            EmbeddedData.install(this);
+        } catch (java.io.IOException e) {
+            Log.e(TAG, "Unable to install embedded voice data", e);
+            throw new IllegalStateException(e);
         }
         Repository.initialize(this);
     }

@@ -16,46 +16,18 @@
 package com.github.olga_yakovleva.rhvoice.android;
 
 import android.content.Context;
-import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.annotation.MainThread;
 import androidx.lifecycle.LiveData;
 import androidx.lifecycle.MutableLiveData;
-import androidx.work.Constraints;
-import androidx.work.ExistingPeriodicWorkPolicy;
-import androidx.work.NetworkType;
-import androidx.work.PeriodicWorkRequest;
-import androidx.work.WorkManager;
 
-import com.github.olga_yakovleva.rhvoice.TTSEngine;
-import com.google.common.base.MoreObjects;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.ListeningExecutorService;
-import com.google.common.util.concurrent.MoreExecutors;
 import com.squareup.moshi.JsonAdapter;
 import com.squareup.moshi.Moshi;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.time.Instant;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-
-import okio.BufferedSource;
-import okio.Okio;
-
-import java.io.InputStreamReader;
-
-import com.google.common.io.CharStreams;
-
-import android.content.SharedPreferences;
-
-import androidx.core.content.ContextCompat;
 
 final class Repository {
     private static final String TAG = "RHVoice.Repository";
@@ -63,26 +35,15 @@ final class Repository {
     private final Context context;
     private volatile PackageDirectory pkgDir;
     private final MutableLiveData<PackageDirectory> pkgDirLiveData;
-    private final Moshi moshi;
     private final JsonAdapter<PackageDirectory> jsonAdapter;
-    private final ListeningExecutorService exec;
-    private final TTSEngine engine;
 
     @MainThread
     private Repository(Context context) {
         this.context = context.getApplicationContext();
-        try {
-            {
-                engine = new TTSEngine("", Config.getDir(this.context).getAbsolutePath(), new String[0], PackageClient.getPath(this.context), CoreLogger.instance);
-            }
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
         pkgDirLiveData = new MutableLiveData<>();
-        moshi = new Moshi.Builder().build();
-        jsonAdapter = moshi.adapter(PackageDirectory.class).nonNull();
-        exec = MoreExecutors.listeningDecorator(Executors.newSingleThreadExecutor());
-	exec.submit(this::initCerts);
+        jsonAdapter = new Moshi.Builder().build()
+                .adapter(PackageDirectory.class)
+                .nonNull();
         initialLoad();
     }
 
@@ -115,101 +76,26 @@ final class Repository {
         if (str == null)
             return false;
         final PackageDirectory dir = jsonAdapter.fromJson(str);
-        dir.nextUpdateTime = Instant.now().plusSeconds(dir.localTtl);
         dir.index();
         pkgDir = dir;
         pkgDirLiveData.postValue(dir);
         return true;
     }
 
-    private String getPackageDirFromResources() throws IOException {
-        try (InputStreamReader reader = new InputStreamReader(context.getResources().openRawResource(R.raw.packages), "utf-8")) {
-            return CharStreams.toString(reader);
-        }
-    }
-
     private void initialLoad() {
         try {
-            {
-                String str = engine.getCachedPackageDir();
-                if (str == null)
-                    str = getPackageDirFromResources();
-                parse(str);
-                scheduleUpdates();
-            }
+            parse(EmbeddedData.readPackageDirectory(context));
         } catch (Exception e) {
             if (BuildConfig.DEBUG)
                 Log.e(TAG, "Error on initial load", e);
         }
     }
 
-    private boolean updateFromServer() {
-        if (BuildConfig.DEBUG)
-            Log.v(TAG, "Updating from server");
-        try {
-            String str = engine.getPackageDirFromServer();
-            if (BuildConfig.DEBUG && str != null)
-                Log.v(TAG, "Response:\n" + str);
-            final PackageDirectory oldDir = getPackageDirectory();
-            final boolean res = parse(str);
-            if (res && oldDir != null && oldDir.ttl != getPackageDirectory().ttl)
-                ContextCompat.getMainExecutor(context).execute(this::scheduleUpdates);
-            return res;
-        } catch (Exception e) {
-            if (BuildConfig.DEBUG)
-                Log.e(TAG, "Error on update from server", e);
-        }
-        return false;
-    }
-
-    private boolean doCheck() {
-        final PackageDirectory dir = getPackageDirectory();
-        if (dir != null && dir.nextUpdateTime.isAfter(Instant.now()))
-            return true;
-        return updateFromServer();
-    }
-
     public ListenableFuture<Boolean> refresh() {
-        return exec.submit(this::updateFromServer);
+        return Futures.immediateFuture(true);
     }
 
     public ListenableFuture<Boolean> check() {
-        return exec.submit(this::doCheck);
+        return Futures.immediateFuture(true);
     }
-
-    private void scheduleUpdates() {
-        final PackageDirectory dir = getPackageDirectory();
-        final SharedPreferences prefs = context.getSharedPreferences("dir", 0);
-        final long newTtl = dir.ttl;
-        final long oldTtl = prefs.getLong("ttl", 0);
-        Constraints constraints = new Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
-                .build();
-        PeriodicWorkRequest.Builder requestBuilder = new PeriodicWorkRequest.Builder(PackageDirectoryWorker.class, newTtl, TimeUnit.SECONDS);
-        requestBuilder.setConstraints(constraints);
-        if (newTtl != oldTtl && dir.localTtl != 0)
-            requestBuilder.setInitialDelay(dir.localTtl, TimeUnit.SECONDS);
-        PeriodicWorkRequest request = requestBuilder.build();
-        ExistingPeriodicWorkPolicy policy = newTtl == oldTtl ? ExistingPeriodicWorkPolicy.KEEP : ExistingPeriodicWorkPolicy.REPLACE;
-        WorkManager.getInstance(context).enqueueUniquePeriodicWork("dir.packages.rhvoice.org", policy, request);
-        prefs.edit().putLong("ttl", newTtl).commit();
-    }
-
-    private void initCerts() {
-	final File file_path=new File(new File(PackageClient.getPath(context)), "cacert.pem");
-	final File tmp_path=new File(file_path.getPath()+".tmp");
-        try(InputStream is=context.getResources().openRawResource(R.raw.cacert))
-            {
-                try(FileOutputStream os=new FileOutputStream(tmp_path))
-                    {
-                        DataPack.copyBytes(is, os, null);
-		    }
-		    }
-        catch(IOException e)
-            {
-		return;
-            }
-		tmp_path.renameTo(file_path);
-	    }
-
-    }
+}
