@@ -21,6 +21,9 @@ task BoostIncludes(type: Sync) {
 
 def embeddedAssetsDir = layout.buildDirectory.dir("generated/embeddedAssets")
 def embeddedDataDir = layout.buildDirectory.dir("generated/embeddedData")
+def embeddedSourceRoot = providers.gradleProperty("RHVoice.embeddedSourceRoot")
+        .map { rootProject.file(it) }
+        .getOrElse(rootProject.file("../.."))
 def customVoicesDir = providers.gradleProperty("RHVoice.customVoicesDir")
         .map { rootProject.file(it) }
         .getOrElse(rootProject.file("../../../customvoices/data/voices"))
@@ -31,14 +34,32 @@ def readInfo = { File infoFile ->
     properties
 }
 
+def hasNonZeroContent = { File file ->
+    if (!file.isFile() || file.length() == 0) {
+        return false
+    }
+    file.withInputStream { stream ->
+        byte[] buffer = new byte[8192]
+        int count
+        while ((count = stream.read(buffer)) != -1) {
+            for (int i = 0; i < count; i++) {
+                if (buffer[i] != 0) {
+                    return true
+                }
+            }
+        }
+        false
+    }
+}
+
 def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
     def languageSources = [
-            rootProject.file("../../data/languages/Russian"),
-            rootProject.file("../../data/languages/English")
+            new File(embeddedSourceRoot, "data/languages/Russian"),
+            new File(embeddedSourceRoot, "data/languages/English")
     ]
     def officialVoiceSources = [
-            rootProject.file("../../data/voices/yuriy"),
-            rootProject.file("../../data/voices/aleksandr-hq")
+            new File(embeddedSourceRoot, "data/voices/yuriy"),
+            new File(embeddedSourceRoot, "data/voices/aleksandr-hq")
     ]
 
     inputs.files(languageSources)
@@ -63,6 +84,13 @@ def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
         languageSources.each { File sourceDir ->
             if (!new File(sourceDir, "language.info").isFile()) {
                 throw new GradleException("Invalid embedded language directory: ${sourceDir}")
+            }
+            File phonemesFile = new File(sourceDir, "phonemes.xml")
+            if (!phonemesFile.isFile() ||
+                    !phonemesFile.getText("UTF-8").contains("<phonemes")) {
+                throw new GradleException(
+                        "Invalid embedded language data in ${sourceDir}: phonemes.xml is missing or corrupt"
+                )
             }
             copy {
                 from sourceDir
@@ -91,6 +119,15 @@ def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
             String voiceName = info.getProperty("name")
             if (!voiceName) {
                 throw new GradleException("Voice name is missing in ${infoFile}")
+            }
+            File voiceDataFile = new File(sourceDir, "24000/voice.data")
+            if (!voiceDataFile.isFile()) {
+                voiceDataFile = new File(sourceDir, "16000/voice.data")
+            }
+            if (!hasNonZeroContent(voiceDataFile)) {
+                throw new GradleException(
+                        "Invalid embedded voice data in ${sourceDir}: voice.data is missing or corrupt"
+                )
             }
             copy {
                 from sourceDir
