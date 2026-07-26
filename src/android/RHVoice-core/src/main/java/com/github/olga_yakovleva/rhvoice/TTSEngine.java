@@ -33,6 +33,8 @@ public final class TTSEngine {
 
     private native void doSpeak(String text, SynthesisParameters params, TTSClient client) throws RHVoiceException;
 
+    private native void doRequestStop();
+
     private native boolean doConfigure(String key, String value);
 
     private native String doGetCachedPackageDir();
@@ -68,6 +70,10 @@ public final class TTSEngine {
         if (params.getVoiceProfile() == null)
             throw new RHVoiceException("Voice not set");
         doSpeak(text, params, client);
+    }
+
+    public void requestStop() {
+        doRequestStop();
     }
 
     public boolean configure(String key, String value) {

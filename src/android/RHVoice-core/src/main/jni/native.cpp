@@ -14,6 +14,7 @@
 /* along with this program.  If not, see <https://www.gnu.org/licenses/>. */
 
 #include <stdint.h>
+#include <atomic>
 #include <stdexcept>
 #include <memory>
 #include <string>
@@ -265,10 +266,12 @@ namespace
   {
   public:
     Data()
+      : request_generation(0)
     {
     }
 
     std::shared_ptr<engine> engine_ptr;
+    std::atomic<std::uint64_t> request_generation;
 
   private:
     Data(const Data&);
@@ -284,6 +287,7 @@ namespace
     bool play_speech(const short*,std::size_t);
     bool set_sample_rate(int);
     event_mask get_supported_events() const;
+    bool is_stopped() const;
     bool word_starts(std::size_t position,std::size_t length);
 
   private:
@@ -296,9 +300,11 @@ namespace
     jmethodID client_setSampleRate_method;
     jmethodID client_rangeStart_method;
     std::vector<jint> byte_to_utf16;
+    std::uint64_t generation;
 
     void build_offset_map(const std::string& text);
     jint utf16_offset(std::size_t byte_pos) const;
+    bool is_current() const;
 
     speak_impl(const speak_impl&);
     speak_impl& operator=(const speak_impl&);
@@ -309,7 +315,8 @@ namespace
     data(get_native_field<Data>(env,self,data_field)),
     input(text),
     params(synth_params),
-    client_object(tts_client)
+    client_object(tts_client),
+    generation(data->request_generation.fetch_add(1,std::memory_order_acq_rel)+1)
   {
     jclass client_class=check(env,env->GetObjectClass(client_object));
     client_playSpeech_method=get_method(env,client_class,"playSpeech","([S)Z");
@@ -343,10 +350,14 @@ namespace
 
   void speak_impl::operator()()
   {
+    if(!is_current())
+      return;
     std::string profile_spec=call_string_getter(env,params,SynthesisParameters_getVoiceProfile_method);
     voice_profile profile=data->engine_ptr->create_voice_profile(profile_spec);
     if(profile.empty())
       throw voice_not_found();
+    if(!is_current())
+      return;
     std::string text=jstring_to_string(env,input);
     build_offset_map(text);
     std::unique_ptr<document> doc;
@@ -354,6 +365,8 @@ namespace
       doc=document::create_from_ssml(data->engine_ptr,text.begin(),text.end(),profile);
     else
       doc=document::create_from_plain_text(data->engine_ptr,text.begin(),text.end(),content_text,profile);
+    if(!is_current())
+      return;
     doc->speech_settings.relative.rate=check(env,env->CallDoubleMethod(params,SynthesisParameters_getRate_method));
     doc->speech_settings.relative.pitch=check(env,env->CallDoubleMethod(params,SynthesisParameters_getPitch_method));
     doc->speech_settings.relative.volume=check(env,env->CallDoubleMethod(params,SynthesisParameters_getVolume_method));
@@ -363,6 +376,8 @@ namespace
 
   bool speak_impl::play_speech(const short* samples,std::size_t count)
   {
+    if(!is_current())
+      return false;
     jshortArray jsamples=check(env,env->NewShortArray(count));
     env->SetShortArrayRegion(jsamples,0,count,samples);
     check(env);
@@ -373,19 +388,33 @@ namespace
 
   bool speak_impl::set_sample_rate(int sr)
   {
+    if(!is_current())
+      return false;
     return check(env,env->CallBooleanMethod(client_object,client_setSampleRate_method,sr));
 }
 
   event_mask speak_impl::get_supported_events() const
   {
-    return event_word_starts;
+    return is_current()?event_word_starts:0;
   }
 
   bool speak_impl::word_starts(std::size_t position,std::size_t length)
   {
+    if(!is_current())
+      return false;
     const jint start=utf16_offset(position);
     const jint end=utf16_offset(position+length);
     return check(env,env->CallBooleanMethod(client_object,client_rangeStart_method,start,end));
+  }
+
+  bool speak_impl::is_stopped() const
+  {
+    return !is_current();
+  }
+
+  bool speak_impl::is_current() const
+  {
+    return data->request_generation.load(std::memory_order_acquire)==generation;
   }
 
   class java_logger_wrapper: public event_logger
@@ -572,6 +601,16 @@ JNIEXPORT void JNICALL Java_com_github_olga_1yakovleva_rhvoice_TTSEngine_doSpeak
 {
   TRY
   speak_impl(env,self,text,synth_params,tts_client)();
+  CATCH1(env);
+}
+
+JNIEXPORT void JNICALL Java_com_github_olga_1yakovleva_rhvoice_TTSEngine_doRequestStop
+  (JNIEnv* env, jobject obj)
+{
+  TRY
+    Data* data=get_native_field<Data>(env,obj,data_field);
+    if(data)
+      data->request_generation.fetch_add(1,std::memory_order_acq_rel);
   CATCH1(env);
 }
 

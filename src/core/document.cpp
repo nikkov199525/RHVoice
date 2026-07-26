@@ -326,13 +326,21 @@ namespace RHVoice
   {
     const language& language_ref=u.get_language();
     language_ref.do_text_analysis(u);
+    if(parent->get_owner().is_stopped())
+      return;
     language_ref.do_pos_tagging(u);
+    if(parent->get_owner().is_stopped())
+      return;
     language_ref.phrasify(u);
     language_ref.detect_utt_type(u);
     language_ref.do_g2p(u);
+    if(parent->get_owner().is_stopped())
+      return;
     language_ref.syllabify(u);
     language_ref.insert_pauses(u);
     language_ref.do_post_lexical_processing(u);
+    if(parent->get_owner().is_stopped())
+      return;
     language_ref.do_syl_accents(u);
     language_ref.set_pitch_modifications(u);
     language_ref.set_duration_modifications(u);
@@ -404,14 +412,22 @@ namespace RHVoice
   std::unique_ptr<utterance> sentence::create_utterance(sentence_position pos) const
   {
     std::unique_ptr<utterance> u=new_utterance();
+    if(parent->get_owner().is_stopped())
+      return std::unique_ptr<utterance>();
     u->set_bilingual_enabled(parent->enable_bilingual);
     apply_speech_settings(*u);
     execute_commands(*u);
+    if(parent->get_owner().is_stopped())
+      return std::unique_ptr<utterance>();
     u->get_language().tokenize(*u);
+    if(parent->get_owner().is_stopped())
+      return std::unique_ptr<utterance>();
     if(pos==sentence_position_single)
       set_spell_single_symbol(*u);
     apply_verbosity_settings(*u);
     apply_language_processing(*u);
+    if(parent->get_owner().is_stopped())
+      return std::unique_ptr<utterance>();
     u->set_quality(parent->quality);
     u->set_flags(parent->get_flags());
     return u;

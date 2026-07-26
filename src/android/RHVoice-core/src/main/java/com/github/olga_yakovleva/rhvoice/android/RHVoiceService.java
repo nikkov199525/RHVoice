@@ -59,6 +59,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -151,12 +152,14 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
         public Map<String, LanguageInfo> languageIndex;
         public Map<String, AndroidVoiceInfo> voiceIndex;
         public List<MappedSetting> mappedSettings;
+        public Set<String> warmedProfiles;
 
         public Tts() {
             voices = new ArrayList<AndroidVoiceInfo>();
             languageIndex = new HashMap<String, LanguageInfo>();
             voiceIndex = new HashMap<String, AndroidVoiceInfo>();
             mappedSettings = new ArrayList<MappedSetting>();
+            warmedProfiles = new HashSet<String>();
         }
 
         public Tts(Tts other, boolean passEngine) {
@@ -164,6 +167,7 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
             this.languageIndex = other.languageIndex;
             this.voiceIndex = other.voiceIndex;
             this.mappedSettings = other.mappedSettings;
+            this.warmedProfiles = other.warmedProfiles;
             if (!passEngine)
                 return;
             this.engine = other.engine;
@@ -223,6 +227,7 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
     private final DataManager dataManager = new DataManager();
     private volatile AndroidVoiceInfo currentVoice;
     private final AtomicLong requestGeneration = new AtomicLong();
+    private final AtomicReference<TTSEngine> activeEngine = new AtomicReference<TTSEngine>();
     private List<String> paths = new ArrayList<String>();
     private Handler handler;
 
@@ -286,6 +291,22 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 callback.rangeStart(framesServed, start, end);
             return isActive(requestId);
+        }
+    }
+
+    private static class WarmupPlayer implements TTSClient {
+        public boolean setSampleRate(int sampleRate) {
+            return true;
+        }
+
+        public boolean playSpeech(short[] samples) {
+            // Loading one buffer is enough to create and retain the native
+            // voice model. Do not generate or play the rest of the phrase.
+            return false;
+        }
+
+        public boolean rangeStart(int start, int end) {
+            return true;
         }
     }
 
@@ -506,6 +527,9 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
     @Override
     public void onDestroy() {
         requestGeneration.incrementAndGet();
+        final TTSEngine engine = activeEngine.get();
+        if (engine != null)
+            engine.requestStop();
         handler.removeCallbacksAndMessages(null);
         unregisterReceiver(packageReceiver);
         LocalBroadcastManager.getInstance(this).unregisterReceiver(dataStateReceiver);
@@ -568,12 +592,18 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
     protected int onLoadLanguage(String language, String country, String variant) {
         if (BuildConfig.DEBUG)
             Log.v(TAG, "onLoadLanguage called");
-        return onIsLanguageAvailable(language, country, variant);
+        final int result = onIsLanguageAvailable(language, country, variant);
+        if (result >= TextToSpeech.LANG_AVAILABLE)
+            warmUpLanguage(language, country, variant);
+        return result;
     }
 
     @Override
     protected void onStop() {
         requestGeneration.incrementAndGet();
+        final TTSEngine engine = activeEngine.get();
+        if (engine != null)
+            engine.requestStop();
     }
 
     private boolean isActive(long requestId) {
@@ -621,7 +651,12 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
             finishWithError(callback);
             return;
         }
+        final TTSEngine engine = tts.engine;
+        activeEngine.set(engine);
+        engine.requestStop();
         try {
+            if (!isActive(requestId))
+                return;
             String language = request.getLanguage();
             String country = request.getCountry();
             String variant = request.getVariant();
@@ -697,6 +732,7 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
                 // when error() or stop() has already been reported.
                 callback.done();
             } finally {
+                activeEngine.compareAndSet(engine, null);
                 ttsManager.release(tts);
             }
         }
@@ -766,6 +802,71 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
     public int onLoadVoice(String name) {
         if (BuildConfig.DEBUG)
             Log.v(TAG, "onLoadVoice called with voice name " + name);
-        return onIsValidVoiceName(name);
+        final int result = onIsValidVoiceName(name);
+        if (result == TextToSpeech.SUCCESS)
+            warmUpVoice(name);
+        return result;
+    }
+
+    private void warmUpVoice(String name) {
+        final Tts tts = ttsManager.acquireForSynthesis();
+        if (tts == null)
+            return;
+        try {
+            final Map<String, LanguageSettings> languageSettings = getLanguageSettings(tts);
+            String language = "";
+            String voiceName = name;
+            final String defaultLanguage = parseDefaultVoiceName(name);
+            if (defaultLanguage != null) {
+                language = defaultLanguage;
+                voiceName = "";
+            } else {
+                for (Map.Entry<String, LanguageInfo> entry : tts.languageIndex.entrySet()) {
+                    final Locale locale = new Locale(entry.getValue().getAlpha2Code());
+                    if (locale.getDisplayLanguage(Locale.ENGLISH).equals(name)) {
+                        language = entry.getKey();
+                        voiceName = "";
+                        break;
+                    }
+                }
+            }
+            warmUpVoice(tts, language, "", "", voiceName, languageSettings);
+        } catch (Exception e) {
+            if (BuildConfig.DEBUG)
+                Log.w(TAG, "Unable to warm up voice", e);
+        } finally {
+            ttsManager.release(tts);
+        }
+    }
+
+    private void warmUpLanguage(String language, String country, String variant) {
+        final Tts tts = ttsManager.acquireForSynthesis();
+        if (tts == null)
+            return;
+        try {
+            warmUpVoice(tts, language, country, variant, "", getLanguageSettings(tts));
+        } catch (Exception e) {
+            if (BuildConfig.DEBUG)
+                Log.w(TAG, "Unable to warm up language", e);
+        } finally {
+            ttsManager.release(tts);
+        }
+    }
+
+    private void warmUpVoice(Tts tts, String language, String country, String variant,
+                             String voiceName, Map<String, LanguageSettings> languageSettings)
+            throws RHVoiceException {
+        final Candidate voice = findBestVoice(tts, language, country, variant, voiceName, false, languageSettings);
+        if (voice.voice == null)
+            return;
+        final String profile = voice.voice.getSource().getName();
+        if (tts.warmedProfiles.contains(profile))
+            return;
+        applyMappedSettings(tts);
+        final SynthesisParameters params = new SynthesisParameters();
+        params.setVoiceProfile(profile);
+        tts.engine.requestStop();
+        tts.engine.speak("а", params, new WarmupPlayer());
+        tts.warmedProfiles.add(profile);
     }
 }

@@ -97,6 +97,14 @@ JNIEXPORT void JNICALL Java_com_github_olga_1yakovleva_rhvoice_TTSEngine_doSpeak
 
 /*
  * Class:     com_github_olga_yakovleva_rhvoice_TTSEngine
+ * Method:    doRequestStop
+ * Signature: ()V
+ */
+JNIEXPORT void JNICALL Java_com_github_olga_1yakovleva_rhvoice_TTSEngine_doRequestStop
+  (JNIEnv *, jobject);
+
+/*
+ * Class:     com_github_olga_yakovleva_rhvoice_TTSEngine
  * Method:    doConfigure
  * Signature: (Ljava/lang/String;Ljava/lang/String;)Z
  */

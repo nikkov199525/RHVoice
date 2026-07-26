@@ -54,6 +54,11 @@ event_done=64
       return 0;
     }
 
+    virtual bool is_stopped() const
+    {
+      return false;
+    }
+
     virtual bool process_mark(const std::string& name)
     {
       return true;
