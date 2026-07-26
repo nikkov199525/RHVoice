@@ -124,6 +124,6 @@ public final class VoicePack extends DataPack {
     public Voice createAndroidVoice(Context ctx) {
         final Locale loc = getAccentTag().createLocale();
         final Set<String> features = isInstalled(ctx) ? ImmutableSet.of() : ImmutableSet.of(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED);
-        return new Voice(getName(), loc, Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false, features);
+        return new Voice(getName(), loc, Voice.QUALITY_NORMAL, Voice.LATENCY_LOW, false, features);
     }
 }

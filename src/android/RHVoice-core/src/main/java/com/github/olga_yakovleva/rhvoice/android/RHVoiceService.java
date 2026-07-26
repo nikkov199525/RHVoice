@@ -50,6 +50,7 @@ import com.google.common.collect.Ordering;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.ShortBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -57,6 +58,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -220,44 +222,57 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
     private final TtsManager ttsManager = new TtsManager();
     private final DataManager dataManager = new DataManager();
     private volatile AndroidVoiceInfo currentVoice;
-    private volatile boolean speaking = false;
+    private final AtomicLong requestGeneration = new AtomicLong();
     private List<String> paths = new ArrayList<String>();
     private Handler handler;
 
     private class Player implements TTSClient {
-        private SynthesisCallback callback;
+        private final SynthesisCallback callback;
+        private final long requestId;
         private int sampleRate;
         private int framesServed;
+        private byte[] audioBuffer = new byte[0];
+        private ShortBuffer shortBuffer;
 
-        public Player(SynthesisCallback callback) {
+        public Player(SynthesisCallback callback, long requestId) {
             this.callback = callback;
+            this.requestId = requestId;
         }
 
         public boolean setSampleRate(int sr) {
+            if (!isActive(requestId))
+                return false;
             if (sampleRate != 0)
                 return true;
+            if (callback.start(sr, AudioFormat.ENCODING_PCM_16BIT, 1)
+                    != TextToSpeech.SUCCESS)
+                return false;
             sampleRate = sr;
-            callback.start(sampleRate, AudioFormat.ENCODING_PCM_16BIT, 1);
             return true;
         }
 
         public boolean playSpeech(short[] samples) {
-            if (!speaking)
+            if (!isActive(requestId))
                 return false;
             if (BuildConfig.DEBUG && sampleRate == 0)
                 throw new IllegalStateException();
-            final ByteBuffer buffer = ByteBuffer.allocate(samples.length * 2);
-            buffer.order(ByteOrder.LITTLE_ENDIAN);
-            buffer.asShortBuffer().put(samples);
-            final byte[] bytes = buffer.array();
-            final int size = callback.getMaxBufferSize();
+            final int byteCount = samples.length * 2;
+            if (audioBuffer.length < byteCount) {
+                audioBuffer = new byte[byteCount];
+                shortBuffer = ByteBuffer.wrap(audioBuffer)
+                        .order(ByteOrder.LITTLE_ENDIAN)
+                        .asShortBuffer();
+            }
+            shortBuffer.clear();
+            shortBuffer.put(samples);
+            final int size = Math.max(2, callback.getMaxBufferSize() & ~1);
             int offset = 0;
             int count;
-            while (offset < bytes.length) {
-                if (!speaking)
+            while (offset < byteCount) {
+                if (!isActive(requestId))
                     return false;
-                count = Math.min(size, bytes.length - offset);
-                if (callback.audioAvailable(bytes, offset, count) != TextToSpeech.SUCCESS)
+                count = Math.min(size, byteCount - offset);
+                if (callback.audioAvailable(audioBuffer, offset, count) != TextToSpeech.SUCCESS)
                     return false;
                 offset += count;
                 framesServed += count / 2;
@@ -266,11 +281,11 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
         }
 
         public boolean rangeStart(int start, int end) {
-            if (!speaking)
+            if (!isActive(requestId))
                 return false;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 callback.rangeStart(framesServed, start, end);
-            return speaking;
+            return isActive(requestId);
         }
     }
 
@@ -490,6 +505,7 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
 
     @Override
     public void onDestroy() {
+        requestGeneration.incrementAndGet();
         handler.removeCallbacksAndMessages(null);
         unregisterReceiver(packageReceiver);
         LocalBroadcastManager.getInstance(this).unregisterReceiver(dataStateReceiver);
@@ -557,7 +573,16 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
 
     @Override
     protected void onStop() {
-        speaking = false;
+        requestGeneration.incrementAndGet();
+    }
+
+    private boolean isActive(long requestId) {
+        return requestGeneration.get() == requestId;
+    }
+
+    private void finishWithError(SynthesisCallback callback) {
+        callback.error();
+        callback.done();
     }
 
     private void applyMappedSettings(Tts tts) {
@@ -576,6 +601,7 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
 
     @Override
     protected void onSynthesizeText(SynthesisRequest request, SynthesisCallback callback) {
+        final long requestId = requestGeneration.incrementAndGet();
         if (BuildConfig.DEBUG) {
             Log.v(TAG, "onSynthesize called");
             logLanguage(request.getLanguage(), request.getCountry(), request.getVariant());
@@ -592,11 +618,10 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
                 Log.w(TAG, "Not initialized yet");
             if (!testing)
                 handler.post(new VoiceInstaller(request.getLanguage(), request.getCountry(), request.getVariant()));
-            callback.error();
+            finishWithError(callback);
             return;
         }
         try {
-            speaking = true;
             String language = request.getLanguage();
             String country = request.getCountry();
             String variant = request.getVariant();
@@ -658,17 +683,22 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
             params.setVoiceProfile(profileSpec);
             params.setRate(((double) rate) / 100.0);
             params.setPitch(((double) pitch) / 100.0);
-            final Player player = new Player(callback);
+            final Player player = new Player(callback, requestId);
             tts.engine.speak(request.getText(), params, player);
             player.setSampleRate(24000);
-            callback.done();
         } catch (Exception e) {
             if (BuildConfig.DEBUG)
                 Log.e(TAG, "Synthesis error", e);
-            callback.error();
+            if (isActive(requestId))
+                callback.error();
         } finally {
-            speaking = false;
-            ttsManager.release(tts);
+            try {
+                // Android clients receive completion only after done(), even
+                // when error() or stop() has already been reported.
+                callback.done();
+            } finally {
+                ttsManager.release(tts);
+            }
         }
     }
 
@@ -707,7 +737,7 @@ public final class RHVoiceService extends TextToSpeechService implements Lifecyc
             }
             if (v != null) {
                 final Locale loc = new Locale(lp.getOldCode());
-                v = new Voice(loc.getDisplayLanguage(Locale.ENGLISH), loc, Voice.QUALITY_NORMAL, Voice.LATENCY_NORMAL, false, ImmutableSet.of());
+                v = new Voice(loc.getDisplayLanguage(Locale.ENGLISH), loc, Voice.QUALITY_NORMAL, Voice.LATENCY_LOW, false, ImmutableSet.of());
                 result.add(v);
             }
         }

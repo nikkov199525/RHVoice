@@ -274,6 +274,19 @@ android {
     }
 
     buildTypes {
+        // This variant keeps Java resources unminified for reliability while
+        // compiling the native synthesizer with release optimizations. It is
+        // signed with the local Android debug key so it can update a locally
+        // installed build without storing signing secrets in the repository.
+        optimized {
+            debuggable false
+            jniDebuggable false
+            minifyEnabled false
+            shrinkResources false
+            signingConfig signingConfigs.debug
+            versionNameSuffix '-optimized'
+        }
+
         release {
             if (rootProject.signRelease) {
                 signingConfig signingConfigs.release
