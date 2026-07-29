@@ -1,6 +1,7 @@
 apply plugin: 'com.android.application'
 
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
 ext.major_version = 1
@@ -24,9 +25,22 @@ def embeddedDataDir = layout.buildDirectory.dir("generated/embeddedData")
 def embeddedSourceRoot = providers.gradleProperty("RHVoice.embeddedSourceRoot")
         .map { rootProject.file(it) }
         .getOrElse(rootProject.file("../.."))
-def customVoicesDir = providers.gradleProperty("RHVoice.customVoicesDir")
+def embeddedProfile = providers.gradleProperty("RHVoice.embeddedProfile")
+        .getOrElse("standard")
+def customVoicesRoot = providers.gradleProperty("RHVoice.customVoicesDir")
         .map { rootProject.file(it) }
-        .getOrElse(rootProject.file("../../../customvoices/data/voices"))
+        .getOrElse(rootProject.file("../../../customvoices"))
+def nestedCustomVoicesDir = new File(customVoicesRoot, "data/voices")
+def customVoicesDir = nestedCustomVoicesDir.isDirectory()
+        ? nestedCustomVoicesDir
+        : customVoicesRoot
+def packageDirectoryTemplate = file("src/main/res/raw/packages.json")
+
+if (!(embeddedProfile in ["standard", "standalone"])) {
+    throw new GradleException(
+            "Unknown RHVoice.embeddedProfile '${embeddedProfile}'; expected standard or standalone"
+    )
+}
 
 def readInfo = { File infoFile ->
     Properties properties = new Properties()
@@ -52,37 +66,76 @@ def hasNonZeroContent = { File file ->
     }
 }
 
-def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
-    def languageSources = [
-            new File(embeddedSourceRoot, "data/languages/Russian"),
-            new File(embeddedSourceRoot, "data/languages/English")
-    ]
-    def officialVoiceSources = [
-            new File(embeddedSourceRoot, "data/voices/yuriy"),
-            new File(embeddedSourceRoot, "data/voices/aleksandr-hq")
-    ]
+def findDataDirectories = { File parentDir, String infoFileName ->
+    parentDir.listFiles()
+            ?.findAll { it.isDirectory() && new File(it, infoFileName).isFile() }
+            ?.sort { it.name.toLowerCase(Locale.ROOT) }
+            ?: []
+}
 
+def languageCodes = [
+        "Albanian"             : ["sq", "sqi"],
+        "Belarusian"           : ["be", "bel"],
+        "Brazilian-Portuguese" : ["pt", "por"],
+        "Croatian"             : ["hr", "hrv"],
+        "Czech"                : ["cs", "ces"],
+        "English"              : ["en", "eng"],
+        "Esperanto"            : ["eo", "epo"],
+        "Georgian"             : ["ka", "kat"],
+        "Kyrgyz"               : ["ky", "kir"],
+        "Luxembourgish"        : ["lb", "ltz"],
+        "Macedonian"           : ["mk", "mkd"],
+        "Polish"               : ["pl", "pol"],
+        "Romanian"             : ["ro", "ron"],
+        "Russian"              : ["ru", "rus"],
+        "Serbian"              : ["sr", "srp"],
+        "Slovak"               : ["sk", "slk"],
+        "Spanish"              : ["es", "spa"],
+        "Tatar"                : ["tt", "tat"],
+        "Ukrainian"            : ["uk", "ukr"],
+        "Uzbek"                : ["uz", "uzb"]
+]
+def defaultVoiceCountries = [
+        "Russian": ["RU", "RUS"]
+]
+
+def languageRoot = new File(embeddedSourceRoot, "data/languages")
+def voiceRoot = new File(embeddedSourceRoot, "data/voices")
+def languageSources = embeddedProfile == "standalone"
+        ? findDataDirectories(languageRoot, "language.info")
+        : [new File(languageRoot, "English"), new File(languageRoot, "Russian")]
+def officialVoiceSources = embeddedProfile == "standalone"
+        ? findDataDirectories(voiceRoot, "voice.info")
+        : [new File(voiceRoot, "yuriy"), new File(voiceRoot, "aleksandr-hq")]
+
+def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
+    inputs.property("embeddedProfile", embeddedProfile)
+    inputs.property("embeddedSourceRoot", embeddedSourceRoot.absolutePath)
+    inputs.property("customVoicesRoot", customVoicesRoot.absolutePath)
     inputs.files(languageSources)
     inputs.files(officialVoiceSources)
-    inputs.dir(customVoicesDir).optional()
+    if (customVoicesRoot.isDirectory()) {
+        inputs.dir(customVoicesRoot)
+    }
+    inputs.file(packageDirectoryTemplate)
     outputs.dir(embeddedAssetsDir)
 
     doLast {
-        if (!customVoicesDir.isDirectory()) {
-            throw new GradleException(
-                    "Custom voices were not found at ${customVoicesDir}. " +
-                            "Set RHVoice.customVoicesDir to the directory containing voice folders."
-            )
-        }
-
         File stagingDir = embeddedDataDir.get().asFile
         File assetsDir = embeddedAssetsDir.get().asFile
         delete(stagingDir, assetsDir)
         stagingDir.mkdirs()
         assetsDir.mkdirs()
 
+        Map<String, Object> template = new JsonSlurper().parse(packageDirectoryTemplate)
+        Map<String, Map<String, Object>> templateLanguages = template.languages.collectEntries {
+            [(it.name.toLowerCase(Locale.ROOT)): it]
+        }
+        Map<String, Map<String, Object>> languageResources = new LinkedHashMap<>()
+
         languageSources.each { File sourceDir ->
-            if (!new File(sourceDir, "language.info").isFile()) {
+            File infoFile = new File(sourceDir, "language.info")
+            if (!infoFile.isFile()) {
                 throw new GradleException("Invalid embedded language directory: ${sourceDir}")
             }
             File phonemesFile = new File(sourceDir, "phonemes.xml")
@@ -97,19 +150,58 @@ def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
                 into new File(stagingDir, "languages/${sourceDir.name}")
                 exclude ".git"
             }
+
+            Properties info = readInfo(infoFile)
+            String languageName = info.getProperty("name") ?: sourceDir.name
+            Map<String, Object> templateLanguage =
+                    templateLanguages[languageName.toLowerCase(Locale.ROOT)]
+            List<String> codes = languageCodes[languageName]
+            if (templateLanguage == null && codes == null) {
+                throw new GradleException(
+                        "No Android locale metadata is available for embedded language ${languageName}"
+                )
+            }
+            languageResources[languageName.toLowerCase(Locale.ROOT)] = [
+                    lang2code   : templateLanguage?.lang2code ?: codes[0],
+                    lang3code   : templateLanguage?.lang3code ?: codes[1],
+                    testMessage: templateLanguage?.testMessage
+                            ?: "The ${languageName} voice is installed and working.",
+                    name        : languageName,
+                    version     : [
+                            major: Integer.parseInt(info.getProperty("format")),
+                            minor: Integer.parseInt(info.getProperty("revision"))
+                    ],
+                    dataUrl     : "",
+                    dataMd5     : "",
+                    id          : info.getProperty("android_id")
+                            ?: templateLanguage?.id
+                            ?: languageName.toLowerCase(Locale.ROOT).replace("-", "_"),
+                    pseudoEnglish: languageName.equalsIgnoreCase("Russian"),
+                    voices      : []
+            ]
         }
 
         List<File> voiceSources = new ArrayList<>(officialVoiceSources)
-        customVoicesDir.listFiles()
-                ?.findAll { it.isDirectory() && new File(it, "voice.info").isFile() }
-                ?.sort { it.name.toLowerCase(Locale.ROOT) }
-                ?.each { voiceSources.add(it) }
-
-        if (voiceSources.size() == officialVoiceSources.size()) {
-            throw new GradleException("No custom voices were found in ${customVoicesDir}")
+        List<File> customVoiceSources = findDataDirectories(customVoicesDir, "voice.info")
+        if (!customVoicesRoot.isDirectory()) {
+            logger.lifecycle(
+                    "customvoices was not found at ${customVoicesRoot}; " +
+                            "building ${embeddedProfile} with repository voices only"
+            )
+        } else if (customVoiceSources.isEmpty()) {
+            logger.lifecycle(
+                    "No custom voices were found below ${customVoicesRoot}; " +
+                            "building ${embeddedProfile} with repository voices only"
+            )
+        } else {
+            logger.lifecycle(
+                    "Including ${customVoiceSources.size()} custom voice(s) from ${customVoicesDir}"
+            )
+            voiceSources.addAll(customVoiceSources)
         }
 
-        List<Map<String, Object>> voiceResources = []
+        Set<String> embeddedVoiceNames = new HashSet<>()
+        Set<String> embeddedVoiceIds = new HashSet<>()
         voiceSources.each { File sourceDir ->
             File infoFile = new File(sourceDir, "voice.info")
             if (!infoFile.isFile()) {
@@ -120,6 +212,15 @@ def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
             if (!voiceName) {
                 throw new GradleException("Voice name is missing in ${infoFile}")
             }
+            String languageName = info.getProperty("language")
+            Map<String, Object> languageResource =
+                    languageResources[languageName?.toLowerCase(Locale.ROOT)]
+            if (languageResource == null) {
+                throw new GradleException(
+                        "Voice ${voiceName} uses language ${languageName}, " +
+                                "which is not included in the ${embeddedProfile} profile"
+                )
+            }
             File voiceDataFile = new File(sourceDir, "24000/voice.data")
             if (!voiceDataFile.isFile()) {
                 voiceDataFile = new File(sourceDir, "16000/voice.data")
@@ -129,62 +230,78 @@ def prepareEmbeddedData = tasks.register("prepareEmbeddedData") {
                         "Invalid embedded voice data in ${sourceDir}: voice.data is missing or corrupt"
                 )
             }
+
+            Map<String, Object> templateLanguage =
+                    templateLanguages[languageName.toLowerCase(Locale.ROOT)]
+            Map<String, Object> templateVoice = templateLanguage?.voices?.find {
+                it.name.equalsIgnoreCase(voiceName) ||
+                        (it.id && it.id.equalsIgnoreCase(
+                                voiceName.toLowerCase(Locale.ROOT).replace("-", "_")))
+            }
+            String voiceId = info.getProperty("android_id")
+                    ?: templateVoice?.id
+                    ?: voiceName.toLowerCase(Locale.ROOT).replace("-", "_")
+            List<String> defaultCountry = defaultVoiceCountries[languageName] ?: ["", ""]
+            if (!embeddedVoiceNames.add(voiceName.toLowerCase(Locale.ROOT))) {
+                throw new GradleException("Duplicate embedded voice name: ${voiceName}")
+            }
+            if (!embeddedVoiceIds.add(voiceId.toLowerCase(Locale.ROOT))) {
+                throw new GradleException("Duplicate embedded voice id: ${voiceId}")
+            }
             copy {
                 from sourceDir
                 into new File(stagingDir, "voices/${voiceName}")
                 exclude ".git"
             }
-            voiceResources.add([
+            languageResource.voices.add([
                     name     : voiceName,
-                    ctry2code: "RU",
-                    ctry3code: "RUS",
+                    ctry2code: templateVoice?.ctry2code ?: defaultCountry[0],
+                    ctry3code: templateVoice?.ctry3code ?: defaultCountry[1],
+                    accent   : templateVoice?.accent ?: "",
+                    demoUrl  : "",
                     version  : [
                             major: Integer.parseInt(info.getProperty("format")),
                             minor: Integer.parseInt(info.getProperty("revision"))
                     ],
                     dataUrl  : "",
                     dataMd5  : "",
-                    id       : voiceName.toLowerCase(Locale.ROOT).replace("-", "_")
+                    id       : voiceId
             ])
         }
 
-        Properties russianInfo = readInfo(new File(languageSources[0], "language.info"))
-        Properties englishInfo = readInfo(new File(languageSources[1], "language.info"))
+        List<Map<String, Object>> packagedLanguages = new ArrayList<>(languageResources.values())
+        packagedLanguages.each { language ->
+            language.voices.sort { it.name.toLowerCase(Locale.ROOT) }
+        }
+
+        Map<String, Map<String, String>> defaultVoices = new LinkedHashMap<>()
+        packagedLanguages.each { language ->
+            if (language.voices.isEmpty()) {
+                return
+            }
+            Set<String> availableIds = language.voices.collect { it.id } as Set
+            Map<String, String> defaults = new LinkedHashMap<>()
+            if (embeddedProfile == "standard" && language.lang2code == "ru" &&
+                    availableIds.contains("yuriy")) {
+                defaults["*"] = "yuriy"
+            } else {
+                template.defaultVoices?.get(language.lang2code)?.each { country, voiceId ->
+                    if (availableIds.contains(voiceId)) {
+                        defaults[country] = voiceId
+                    }
+                }
+                if (!defaults.containsKey("*")) {
+                    defaults["*"] = language.voices[0].id
+                }
+            }
+            defaultVoices[language.lang2code] = defaults
+        }
+
         Map<String, Object> packageDirectory = [
                 ttl          : 86400,
                 localTtl     : 0,
-                languages    : [
-                        [
-                                lang2code   : "en",
-                                lang3code   : "eng",
-                                testMessage: "If you can hear this message, the voice is installed and working.",
-                                name        : "English",
-                                version     : [
-                                        major: Integer.parseInt(englishInfo.getProperty("format")),
-                                        minor: Integer.parseInt(englishInfo.getProperty("revision"))
-                                ],
-                                dataUrl     : "",
-                                dataMd5     : "",
-                                id          : "english",
-                                voices      : []
-                        ],
-                        [
-                                lang2code   : "ru",
-                                lang3code   : "rus",
-                                testMessage: "Если вы слышите это сообщение, значит, голос установлен и работает.",
-                                name        : "Russian",
-                                version     : [
-                                        major: Integer.parseInt(russianInfo.getProperty("format")),
-                                        minor: Integer.parseInt(russianInfo.getProperty("revision"))
-                                ],
-                                dataUrl     : "",
-                                dataMd5     : "",
-                                id          : "russian",
-                                pseudoEnglish: true,
-                                voices      : voiceResources
-                        ]
-                ],
-                defaultVoices: [ru: ["*": "yuriy"]]
+                languages    : packagedLanguages,
+                defaultVoices: defaultVoices
         ]
         new File(stagingDir, "packages.json").setText(
                 JsonOutput.prettyPrint(JsonOutput.toJson(packageDirectory)),
