@@ -363,7 +363,7 @@ android {
         applicationId "com.github.olga_yakovleva.rhvoice.android"
         versionName "${major_version}.${minor_version}.${revision_number}"
         ndk {
-            abiFilters 'armeabi-v7a', 'x86', 'arm64-v8a', 'x86_64'
+            abiFilters 'armeabi-v7a', 'arm64-v8a'
         }
         externalNativeBuild {
             ndkBuild {
